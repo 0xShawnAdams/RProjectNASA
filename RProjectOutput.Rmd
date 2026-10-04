@@ -1,0 +1,532 @@
+---
+title: "NASA Lithium-Ion Battery Aging Analysis"
+author: "Shawn Adams"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+geometry: margin=0.8in
+---
+
+```{r setup, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+
+library(R.matlab)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(here)
+
+mat_files <- list.files(
+  here::here("data", "nasa_battery"),
+  pattern = "\\.mat$",
+  recursive = TRUE,
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+stopifnot(length(mat_files) > 0)
+
+get_operation <- function(cycle_array, i) {
+  fields <- dimnames(cycle_array)[[1]]
+
+  operation_values <- as.vector(
+    cycle_array[, 1, i, drop = FALSE]
+  )
+
+  setNames(operation_values, fields)
+}
+
+get_data_fields <- function(operation) {
+  fields <- dimnames(operation$data)[[1]]
+
+  data_values <- as.vector(
+    operation$data[, 1, 1, drop = FALSE]
+  )
+
+  setNames(data_values, fields)
+}
+
+extract_discharge_data <- function(mat_file) {
+  raw <- R.matlab::readMat(mat_file)
+
+  battery_id <- names(raw)[1]
+  battery <- raw[[battery_id]]
+
+  # The MATLAB battery struct has a field named "cycle".
+  # It is stored as the first list element in this NASA file format.
+  cycle_array <- battery[[1]]
+
+  cycle_dimensions <- dim(cycle_array)
+
+  if (
+    is.null(cycle_dimensions) ||
+    length(cycle_dimensions) < 3 ||
+    is.na(cycle_dimensions[3]) ||
+    cycle_dimensions[3] < 1
+  ) {
+    stop(
+      "Could not find a valid cycle array in: ", mat_file,
+      "\nBattery variable: ", battery_id,
+      "\nObject structure:\n",
+      paste(capture.output(str(battery, max.level = 3)), collapse = "\n")
+    )
+  }
+
+  n_operations <- as.integer(cycle_dimensions[3])
+
+  map_dfr(seq_len(n_operations), function(i) {
+    operation <- get_operation(cycle_array, i)
+
+    operation_type <- if (
+      is.null(operation$type) ||
+      length(operation$type) == 0 ||
+      is.na(operation$type[1])
+    ) {
+      NA_character_
+    } else {
+      trimws(as.character(operation$type)[1])
+    }
+
+    if (is.na(operation_type) || operation_type != "discharge") {
+      return(NULL)
+    }
+
+    if (is.null(operation$data)) {
+      return(NULL)
+    }
+
+    data <- get_data_fields(operation)
+
+    capacity_ah <- if ("Capacity" %in% names(data)) {
+      as.numeric(data$Capacity)[1]
+    } else {
+      NA_real_
+    }
+
+    temperature_values <- if ("Temperature.measured" %in% names(data)) {
+      as.numeric(data$Temperature.measured)
+    } else {
+      numeric(0)
+    }
+
+    voltage_values <- if ("Voltage.measured" %in% names(data)) {
+      as.numeric(data$Voltage.measured)
+    } else {
+      numeric(0)
+    }
+
+    current_values <- if ("Current.measured" %in% names(data)) {
+      as.numeric(data$Current.measured)
+    } else {
+      numeric(0)
+    }
+
+    time_values <- if ("Time" %in% names(data)) {
+      as.numeric(data$Time)
+    } else {
+      numeric(0)
+    }
+
+    valid_energy_data <- (
+      length(time_values) >= 2 &&
+      length(voltage_values) == length(time_values) &&
+      length(current_values) == length(time_values) &&
+      all(is.finite(time_values)) &&
+      all(is.finite(voltage_values)) &&
+      all(is.finite(current_values)) &&
+      all(diff(time_values) >= 0)
+    )
+
+    energy_wh <- if (valid_energy_data) {
+      -sum(
+        diff(time_values) *
+          (head(voltage_values, -1) + tail(voltage_values, -1)) / 2 *
+          (head(current_values, -1) + tail(current_values, -1)) / 2
+      ) / 3600
+    } else {
+      NA_real_
+    }
+
+    tibble(
+      battery_id = battery_id,
+      operation_index = i,
+
+      ambient_temperature_c = if (
+        !is.null(operation$ambient.temperature) &&
+        length(operation$ambient.temperature) > 0
+      ) {
+        as.numeric(operation$ambient.temperature)[1]
+      } else {
+        NA_real_
+      },
+
+      capacity_ah = capacity_ah,
+
+      mean_temperature_c = if (length(temperature_values) > 0) {
+        mean(temperature_values, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+
+      max_temperature_c = if (length(temperature_values) > 0) {
+        max(temperature_values, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+
+      mean_voltage_v = if (length(voltage_values) > 0) {
+        mean(voltage_values, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+
+      discharge_duration_sec = if (length(time_values) > 0) {
+        max(time_values, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+
+      energy_wh = energy_wh,
+      n_measurements = length(time_values)
+    )
+  }) |>
+    mutate(
+      discharge_cycle = row_number(),
+      battery_id = factor(battery_id)
+    ) |>
+    select(
+      battery_id,
+      discharge_cycle,
+      operation_index,
+      capacity_ah,
+      mean_temperature_c,
+      ambient_temperature_c,
+      max_temperature_c,
+      mean_voltage_v,
+      discharge_duration_sec,
+      energy_wh,
+      n_measurements
+    )
+}
+
+all_capacity <- map_dfr(mat_files, extract_discharge_data)
+
+dir.create(here::here("output"), showWarnings = FALSE)
+
+write_csv(
+  all_capacity,
+  here::here("output", "nasa_battery_discharge_cycles.csv")
+)
+```
+
+# Data Description
+
+This dataset describes lithium-ion battery aging experiments conducted on four battery cells identified as B0005, B0006, B0007, and B0018. Each observation in our analysis represents one recorded discharge cycle, and the final dataset contains **`r nrow(all_capacity)` observations**. The two numerical variables are discharge capacity, measured in ampere-hours (Ah), and mean measured battery temperature during discharge, measured in degrees Celsius. The categorical variable is battery ID, which identifies the individual battery cell that produced each discharge-cycle observation. We chose this dataset because it contains real-world engineering measurements that allow us to examine battery aging and compare performance across multiple cells. The original data were downloaded from NASA's [Li-ion Battery Aging Dataset](https://data.nasa.gov/dataset/li-ion-battery-aging-datasets) as MATLAB `.mat` files and converted into a discharge-cycle dataset in R.
+
+# Numerical Data Analysis
+
+## Discharge Capacity
+
+```{r capacity-statistics, echo=TRUE}
+capacity_stats <- tibble(
+  statistic = c(
+    "Mean",
+    "Median",
+    "Standard deviation",
+    "Minimum",
+    "First quartile (Q1)",
+    "Third quartile (Q3)",
+    "Maximum"
+  ),
+  value = c(
+    mean(all_capacity$capacity_ah, na.rm = TRUE),
+    median(all_capacity$capacity_ah, na.rm = TRUE),
+    sd(all_capacity$capacity_ah, na.rm = TRUE),
+    min(all_capacity$capacity_ah, na.rm = TRUE),
+    quantile(all_capacity$capacity_ah, 0.25, na.rm = TRUE),
+    quantile(all_capacity$capacity_ah, 0.75, na.rm = TRUE),
+    max(all_capacity$capacity_ah, na.rm = TRUE)
+  )
+)
+
+capacity_stats
+```
+
+## Mean Discharge Temperature
+
+```{r temperature-statistics, echo=TRUE}
+temperature_stats <- tibble(
+  statistic = c(
+    "Mean",
+    "Median",
+    "Standard deviation",
+    "Minimum",
+    "First quartile (Q1)",
+    "Third quartile (Q3)",
+    "Maximum"
+  ),
+  value = c(
+    mean(all_capacity$mean_temperature_c, na.rm = TRUE),
+    median(all_capacity$mean_temperature_c, na.rm = TRUE),
+    sd(all_capacity$mean_temperature_c, na.rm = TRUE),
+    min(all_capacity$mean_temperature_c, na.rm = TRUE),
+    quantile(all_capacity$mean_temperature_c, 0.25, na.rm = TRUE),
+    quantile(all_capacity$mean_temperature_c, 0.75, na.rm = TRUE),
+    max(all_capacity$mean_temperature_c, na.rm = TRUE)
+  )
+)
+
+temperature_stats
+```
+
+## Interpretation
+
+The mean discharge capacity was **`r round(mean(all_capacity$capacity_ah, na.rm = TRUE), 3)` Ah**, while the median was **`r round(median(all_capacity$capacity_ah, na.rm = TRUE), 3)` Ah**. The standard deviation of discharge capacity was **`r round(sd(all_capacity$capacity_ah, na.rm = TRUE), 3)` Ah**, which indicates that capacities varied across the recorded discharge cycles and across battery cells. The capacity histogram and box plot show the overall spread of capacity measurements and allow comparison of capacity distributions among the four batteries. The mean measured discharge temperature was **`r round(mean(all_capacity$mean_temperature_c, na.rm = TRUE), 2)` °C**, with a standard deviation of **`r round(sd(all_capacity$mean_temperature_c, na.rm = TRUE), 2)` °C**. The temperature histogram and box plot show whether the battery cells operated at similar average temperatures or had noticeably different temperature ranges.
+
+# Required Graphs
+
+## Histogram: Discharge Capacity
+
+```{r capacity-histogram, echo=TRUE, fig.width=9, fig.height=5.5}
+ggplot(all_capacity, aes(x = capacity_ah)) +
+  geom_histogram(
+    binwidth = 0.05,
+    fill = "#2C7FB8",
+    color = "white"
+  ) +
+  labs(
+    title = "Distribution of Battery Discharge Capacity",
+    x = "Discharge capacity (Ah)",
+    y = "Number of discharge cycles"
+  ) +
+  theme_minimal()
+```
+
+## Histogram: Mean Discharge Temperature
+
+```{r temperature-histogram, echo=TRUE, fig.width=9, fig.height=5.5}
+ggplot(all_capacity, aes(x = mean_temperature_c)) +
+  geom_histogram(
+    binwidth = 1,
+    fill = "#F28E2B",
+    color = "white"
+  ) +
+  labs(
+    title = "Distribution of Mean Discharge Temperature",
+    x = "Mean measured temperature (°C)",
+    y = "Number of discharge cycles"
+  ) +
+  theme_minimal()
+```
+
+## Box Plot: Discharge Capacity by Battery
+
+```{r capacity-boxplot, echo=TRUE, fig.width=9, fig.height=5.5}
+ggplot(
+  all_capacity,
+  aes(x = battery_id, y = capacity_ah, fill = battery_id)
+) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(
+    title = "Discharge Capacity by Battery",
+    x = "Battery ID",
+    y = "Discharge capacity (Ah)"
+  ) +
+  theme_minimal()
+```
+
+# Categorical Data Analysis
+
+The categorical variable is battery ID. Each category identifies one of the four tested cells: B0005, B0006, B0007, and B0018.
+
+## Frequency Table
+
+```{r battery-frequency-table, echo=TRUE}
+battery_counts <- all_capacity |>
+  count(battery_id, name = "number_of_discharge_cycles") |>
+  mutate(
+    percent = round(
+      100 * number_of_discharge_cycles / sum(number_of_discharge_cycles),
+      1
+    )
+  )
+
+battery_counts
+```
+
+## Energy Summary by Battery
+
+```{r energy-summary, echo=TRUE}
+energy_by_battery <- all_capacity |>
+  group_by(battery_id) |>
+  summarise(
+    total_energy_wh = sum(energy_wh, na.rm = TRUE),
+    mean_energy_per_discharge_wh = mean(energy_wh, na.rm = TRUE),
+    number_of_discharge_cycles = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    percent_of_total_energy =
+      100 * total_energy_wh / sum(total_energy_wh)
+  )
+
+energy_by_battery
+```
+
+## Pie Chart: Total Energy by Battery
+
+```{r energy-pie-chart, echo=TRUE, fig.width=8, fig.height=6}
+ggplot(
+  energy_by_battery,
+  aes(
+    x = "",
+    y = total_energy_wh,
+    fill = battery_id
+  )
+) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(
+      label = paste0(
+        battery_id,
+        "\n",
+        round(percent_of_total_energy, 1),
+        "%"
+      )
+    ),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    fontface = "bold",
+    size = 4
+  ) +
+  labs(
+    title = "Share of Total Energy Delivered by Each Battery",
+    subtitle = "Summed across all recorded discharge cycles",
+    fill = "Battery ID"
+  ) +
+  theme_void()
+```
+
+## Bar Graph: Total Energy by Battery
+
+```{r energy-bar-chart, echo=TRUE, fig.width=9, fig.height=5.5}
+ggplot(
+  energy_by_battery,
+  aes(
+    x = reorder(battery_id, total_energy_wh),
+    y = total_energy_wh,
+    fill = battery_id
+  )
+) +
+  geom_col(show.legend = FALSE) +
+  geom_text(
+    aes(label = round(total_energy_wh, 1)),
+    vjust = -0.4
+  ) +
+  labs(
+    title = "Total Energy Delivered Across the Observed Test Lifetime",
+    x = "Battery ID",
+    y = "Total delivered energy (Wh)"
+  ) +
+  theme_minimal()
+```
+
+# Additional Visualizations
+
+## Capacity Fade Over Discharge Cycles
+
+```{r capacity-fade, echo=TRUE, fig.width=10, fig.height=6}
+ggplot(
+  all_capacity,
+  aes(
+    x = discharge_cycle,
+    y = capacity_ah,
+    color = battery_id
+  )
+) +
+  geom_hline(
+    yintercept = 1.4,
+    linetype = "dashed",
+    color = "firebrick",
+    linewidth = 0.8
+  ) +
+  geom_line(linewidth = 0.75) +
+  geom_point(size = 0.8, alpha = 0.65) +
+  labs(
+    title = "Capacity Fade Across NASA Lithium-Ion Batteries",
+    subtitle = "Dashed line marks the 1.4 Ah end-of-life reference",
+    x = "Discharge-cycle number within each battery",
+    y = "Measured discharge capacity (Ah)",
+    color = "Battery"
+  ) +
+  theme_minimal()
+```
+
+## Capacity Versus Discharge Duration
+
+```{r capacity-duration-scatter, echo=TRUE, fig.width=10, fig.height=6}
+ggplot(
+  all_capacity,
+  aes(
+    x = discharge_duration_sec / 60,
+    y = capacity_ah,
+    color = battery_id
+  )
+) +
+  geom_point(alpha = 0.65, size = 1.5) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Discharge Capacity Versus Discharge Duration",
+    subtitle = "Each point represents one discharge operation",
+    x = "Discharge duration (minutes)",
+    y = "Measured capacity (Ah)",
+    color = "Battery"
+  ) +
+  theme_minimal()
+```
+
+```{r capacity-duration-correlation, echo=TRUE}
+cor.test(
+  all_capacity$capacity_ah,
+  all_capacity$discharge_duration_sec,
+  use = "complete.obs"
+)
+```
+
+## Mean Discharge Temperature by Battery
+
+```{r temperature-boxplot, echo=TRUE, fig.width=9, fig.height=5.5}
+ggplot(
+  all_capacity,
+  aes(
+    x = battery_id,
+    y = mean_temperature_c,
+    fill = battery_id
+  )
+) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(
+    title = "Mean Discharge Temperature by Battery",
+    x = "Battery ID",
+    y = "Mean measured temperature (°C)"
+  ) +
+  theme_minimal()
+```
+
+# Data Source
+
+NASA Open Data Portal. [Li-ion Battery Aging Datasets](https://data.nasa.gov/dataset/li-ion-battery-aging-datasets). The original MATLAB data files were downloaded and processed in R to create one observation per recorded discharge cycle.
